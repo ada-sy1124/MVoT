@@ -1,0 +1,4 @@
+/data/
+__pycache__/sample_merge_jsonl.cpython-313.pyc
+__pycache__/build_sft_prompts.cpython-313.pyc
+__pycache__/render_maze_frames.cpython-313.pyc
