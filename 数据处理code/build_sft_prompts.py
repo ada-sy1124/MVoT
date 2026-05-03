@@ -7,13 +7,21 @@ from typing import Any, Dict, List, Sequence, Tuple
 # =========================
 # Key parameters: edit here if needed
 # =========================
+# 输入的合并后迷宫样本 JSONL 路径（每行一个样本）
 INPUT_JSONL = "data/maze_dataset_merged_600.jsonl"
+# 渲染好的迷宫轨迹图像根目录，脚本会按 sample_xxxxxx 子目录去匹配图片
 IMAGE_ROOT = "data/600image"
-OUTPUT_JSONL = "data/maze_navigation_sft_600.jsonl"
+# 输出的 SFT/transition 样本 JSONL 路径
+OUTPUT_JSONL = "data/maze_训练样本1.jsonl"
+# 是否强制要求图像文件存在：
+# True: 缺图就报错终止；False: 允许缺图路径写入（通常配合 --allow-missing-images）
 REQUIRE_IMAGES = True
+# 多模态占位符 token，会写入 conversations 的 value 中
 IMAGE_TOKEN = "<image>"
+# 从 merged 数据集的第几个样本开始处理（包含该下标）
 START_INDEX = 0
-END_INDEX = 5
+# 处理到第几个样本结束（不包含该下标）；None 表示处理到结尾
+END_INDEX = 1
 
 
 ACTION_TEXT = {
@@ -22,6 +30,7 @@ ACTION_TEXT = {
     "left": "go left",
     "right": "go right",
 }
+SYSTEM_PROMPT = "You are a deterministic visual world model. Map the given observation and action to the next visual state."
 
 
 Coord = Tuple[int, int]
@@ -211,7 +220,7 @@ def build_sft_records(
     end_index: int | None = END_INDEX,
 ) -> List[Dict[str, Any]]:
     """
-    Build SFT records from maze samples and rendered image paths.
+    Build transition-style SFT records from maze samples and rendered image paths.
 
     Args:
         samples: Maze samples from the merged JSONL file.
@@ -221,7 +230,7 @@ def build_sft_records(
         end_index: Exclusive end index in the merged JSONL file. None means the end of the file.
 
     Returns:
-        SFT records ready to save as JSONL.
+        Transition records ready to save as JSONL.
     """
     sft_records: List[Dict[str, Any]] = []
     selected_samples = samples[start_index:end_index]
@@ -233,29 +242,35 @@ def build_sft_records(
         if require_images:
             validate_image_paths(image_paths)
 
-        sft_records.append(
-            {
-                "id": f"maze_nav_{sample_index:06d}",
-                "images": image_paths,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": build_prompt(sample),
+        for step_idx, action in enumerate(moves):
+            sft_records.append(
+                {
+                    "id": f"maze_env_transition_{sample_index:06d}_{step_idx:04d}",
+                    "image": [image_paths[step_idx], image_paths[step_idx + 1]],
+                    "conversations": [
+                        {
+                            "from": "system",
+                            "value": SYSTEM_PROMPT,
+                        },
+                        {
+                            "from": "user",
+                            "value": f"{IMAGE_TOKEN}\nAction: {action}",
+                        },
+                        {
+                            "from": "assistant",
+                            "value": IMAGE_TOKEN,
+                        },
+                    ],
+                    "metadata": {
+                        "sample_index": sample_index,
+                        "step_index": step_idx,
+                        "source_file": sample.get("source_file"),
+                        "source_sample_index": sample.get("source_sample_index"),
+                        "maze_id": sample.get("id"),
+                        "action": action,
                     },
-                    {
-                        "role": "assistant",
-                        "content": build_response(sample),
-                    },
-                ],
-                "metadata": {
-                    "sample_index": sample_index,
-                    "source_file": sample.get("source_file"),
-                    "source_sample_index": sample.get("source_sample_index"),
-                    "maze_id": sample.get("id"),
-                    "answer": sample["end_label"],
-                },
-            }
-        )
+                }
+            )
 
     return sft_records
 
@@ -268,12 +283,38 @@ def parse_args() -> argparse.Namespace:
         Parsed command line arguments.
     """
     parser = argparse.ArgumentParser(description="Build English maze-navigation SFT JSONL records.")
-    parser.add_argument("--input", default=INPUT_JSONL, help="Input merged maze JSONL file.")
-    parser.add_argument("--image-root", default=IMAGE_ROOT, help="Root directory of rendered maze images.")
-    parser.add_argument("--output", default=OUTPUT_JSONL, help="Output SFT JSONL file.")
-    parser.add_argument("--start-index", type=int, default=START_INDEX, help="Inclusive start sample index.")
-    parser.add_argument("--end-index", type=int, default=END_INDEX, help="Exclusive end sample index. Omit to use all remaining samples.")
-    parser.add_argument("--allow-missing-images", action="store_true", help="Do not fail if rendered images are missing.")
+    parser.add_argument(
+        "--input",
+        default=INPUT_JSONL,
+        help="输入 merged 迷宫 JSONL 文件路径（默认使用文件头 INPUT_JSONL）。",
+    )
+    parser.add_argument(
+        "--image-root",
+        default=IMAGE_ROOT,
+        help="渲染图像根目录（默认 data/600image，会在其下查找 sample_xxxxxx 子目录）。",
+    )
+    parser.add_argument(
+        "--output",
+        default=OUTPUT_JSONL,
+        help="输出 JSONL 文件路径。",
+    )
+    parser.add_argument(
+        "--start-index",
+        type=int,
+        default=START_INDEX,
+        help="起始样本下标（包含）。例如 0 表示从第一条样本开始。",
+    )
+    parser.add_argument(
+        "--end-index",
+        type=int,
+        default=END_INDEX,
+        help="结束样本下标（不包含）。例如 5 表示处理 [0, 5) 共 5 条；省略可处理到末尾。",
+    )
+    parser.add_argument(
+        "--allow-missing-images",
+        action="store_true",
+        help="允许缺失图像文件时继续生成（开启后不会因缺图报错终止）。",
+    )
     return parser.parse_args()
 
 
