@@ -6,3 +6,6 @@ __pycache__/render_maze_frames.cpython-313.pyc
 训练脚本/__pycache__/train.cpython-313.pyc
 训练脚本/__pycache__/custom_trainer.cpython-313.pyc
 数据处理code/__pycache__/render_maze_frames.cpython-313.pyc
+数据处理code/__pycache__/build_sft_prompts.cpython-312.pyc
+数据处理code/__pycache__/build_sft_prompts.cpython-313.pyc
+训练脚本/__pycache__/custom_trainer.cpython-312.pyc
