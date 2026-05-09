@@ -18,16 +18,16 @@ import matplotlib.pyplot as plt
 # =========================
 # 关键参数：按需修改这里即可
 # =========================
-INPUT_PATH = "data/maze_dataset_merged_600.jsonl"
-OUTPUT_DIR = "600image"
+INPUT_PATH = "data/训练样本/maze_dataset_merged_600.jsonl"
+OUTPUT_DIR = "data/600个单步样本image_1"
 RENDER_ALL_SAMPLES = True #是否应用于整个jsonl文件
 SAMPLE_INDEX = 10 #如果上面是False，就会只应用于这个样本
 FRAME_STRIDE = 1 #表示每一步都+1连续画图，2的话就表示当前步数+2画图
 DPI = 180 #输出的分辨率
 DRAW_LABELS = True #是否画ABCD的位置
-WALL_LINEWIDTH = 3.0 #迷宫黑色墙线的粗细
-PATH_LINEWIDTH = 3.0 #红色路径线的粗细
-
+WALL_LINEWIDTH = 8.0 #迷宫黑色墙线的粗细
+PATH_LINEWIDTH = 8.0 #红色路径线的粗细
+LABEL_FONTSIZE = 25
 
 Coord = Tuple[int, int]
 DELTA_BY_ACTION = {
@@ -251,15 +251,28 @@ def draw_move_frame(
         if label_points:
             for label in sorted(label_points):
                 x, y = coord_to_plot(label_points[label])
-                ax.text(x, y, label, ha="center", va="center", fontsize=13, color="#222222")
+                # 修改点：接入 LABEL_FONTSIZE，添加 fontweight="bold"，颜色改为纯黑
+                ax.text(x, y, label, ha="center", va="center", 
+                        fontsize=LABEL_FONTSIZE, fontweight="bold", color="black", zorder=5)
         else:
             ex, ey = coord_to_plot(end)
-            ax.text(ex, ey, "E", ha="center", va="center", fontsize=13, color="#222222")
+            # 修改点：接入 LABEL_FONTSIZE，添加 fontweight="bold"，颜色改为纯黑
+            ax.text(ex, ey, "E", ha="center", va="center", 
+                    fontsize=LABEL_FONTSIZE, fontweight="bold", color="black", zorder=5)
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.subplots_adjust(left=0.02, right=0.98, top=0.98, bottom=0.02)
-    fig.savefig(output_path, dpi=dpi, facecolor="white")
+    
+    # 🌟 关键 1：让坐标轴（Axes）绝对填满整个画布（Figure），不留一点缝隙
+    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
+    
+    # 🌟 关键 2：稍微往外扩充一点点视野，确保外面那圈粗壮的黑墙不会因为贴边而被裁切变细
+    offset = (WALL_LINEWIDTH / 2) / 72.0  # 计算线条的一半宽度
+    ax.set_xlim(-offset, logical_cols + offset)
+    ax.set_ylim(logical_rows + offset, -offset)
+    
+    # 🌟 关键 3：直接保存，去掉所有强制 Padding
+    fig.savefig(output_path, dpi=dpi, facecolor="white", pad_inches=0)
     plt.close(fig)
 
 
@@ -413,3 +426,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# python ./maze准备/maze绘图.py
