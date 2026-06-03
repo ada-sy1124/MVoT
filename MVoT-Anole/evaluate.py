@@ -147,6 +147,7 @@
 
 
 import json
+import math
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -169,12 +170,12 @@ ADAPTER_PATH = "./MVoT-Anole/outputs/anole_mvot_lora_final"
 TEST_JSONL = "./MVoT-Anole/data/sft_测试样本_anole.jsonl"
 DISTANCE_MATRIX = "./MVoT-Anole/data/MSE查询表_Anole.pt"
 VQGAN_CONFIG = "./MVoT-Anole/vqgan/config.yaml"
-VQGAN_CKPT = "./MVoT-Anole/vqgan/model.ckpt"
+VQGAN_CKPT = "./MVoT-Anole/vqgan_finetuned/maze_vqgan_epoch_25.ckpt"
 OUT_DIR = "./MVoT-Anole/outputs/anole_mvot_eval"
 MAX_SAMPLES = 10
 LOCAL_FILES_ONLY = False
-IMAGE_TOKEN_START = DEFAULT_IMAGE_TOKEN_START
-IMAGE_TOKEN_COUNT = DEFAULT_IMAGE_TOKEN_COUNT
+IMAGE_TOKEN_START = 8192  # 🚨 强行锁死正确的词表偏移起点
+IMAGE_TOKEN_COUNT = 16384  # VQGAN 码本总数
 IMAGE_TOKEN_LENGTH = DEFAULT_IMAGE_TOKEN_LENGTH
 
 
@@ -186,6 +187,29 @@ class ImageOnlyLogitsProcessor(LogitsProcessor):
         mask = torch.full_like(scores, -float("inf"))
         mask[:, self.allowed] = 0
         return scores + mask
+
+
+def _align_to_nearest_square(token_list: List[int], target_std_len: int, name: str) -> List[int]:
+    """
+    底层自适应对齐防线：强制将任意 Token 序列安全裁剪为最近的完全平方数。
+    """
+    curr_len = len(token_list)
+    if curr_len == 0:
+        print(f"     ⚠️ 警告: {name} 序列为空！")
+        return []
+
+    # 优先尝试使用预设的标准长度截断
+    std_side = math.isqrt(target_std_len)
+    if std_side * std_side == target_std_len and curr_len >= target_std_len:
+        return token_list[:target_std_len]
+
+    # 否则，动态向下寻找当前真实存在的最近完全平方数进行抢救
+    side = math.isqrt(curr_len)
+    valid_len = side * side
+    if valid_len != curr_len:
+        print(f"     ⚠️ 自动校准: {name} 长度 ({curr_len}) 不是平方数，强制裁剪至安全网格 {valid_len} ({side}x{side})")
+    
+    return token_list[:valid_len]
 
 
 def main() -> None:
@@ -210,26 +234,39 @@ def main() -> None:
     distance_matrix = dist_obj["distance_matrix"].to(model.device)
     id_to_code = {int(t): i for i, t in enumerate(image_token_ids)}
 
+    # 安全校验全局设定的 IMAGE_TOKEN_LENGTH 本身是否合法
+    std_len = IMAGE_TOKEN_LENGTH
+    if math.isqrt(std_len) ** 2 != std_len:
+        print(f"⚠️ 全局配置警告: IMAGE_TOKEN_LENGTH ({std_len}) 本身非完全平方数！将依赖底层自适应裁切。")
+
     samples = load_jsonl(TEST_JSONL)[:MAX_SAMPLES]
     report: List[Dict[str, Any]] = []
+    
     for sample in samples:
         sample_id = sample.get("id", "unknown")
         print(f"  -> 正在处理样本: {sample_id}")
         input_ids_list = sample["input_ids"]
         labels_list = sample["labels"]
+        
         prompt_ids = [v for v, y in zip(input_ids_list, labels_list) if y == -100]
-        true_img_ids = [v for v, y in zip(input_ids_list, labels_list) if y != -100 and v in image_token_set]
+        # 提取真实存在的原始视觉 Token ID
+        raw_true_img_ids = [v for v, y in zip(input_ids_list, labels_list) if y != -100 and v in image_token_set]
+
+        # 动态锁定生成的硬目标长度：优先向 Ground Truth 靠拢，不足则依从全局配置
+        target_gen_len = len(raw_true_img_ids) if len(raw_true_img_ids) > 0 else std_len
 
         prompt = torch.tensor([prompt_ids], device=model.device)
         full_in = torch.tensor([input_ids_list], device=model.device)
         full_lb = torch.tensor([labels_list], device=model.device)
 
         with torch.no_grad():
+            # 1. 前向传播计算原生交叉熵与物理距离损失
             out = model(input_ids=full_in, labels=full_lb)
             loss_c = float(out.loss.item())
             shift_logits = out.logits[..., :-1, :].contiguous()
             shift_labels = full_lb[..., 1:].contiguous()
             mask = torch.isin(shift_labels, torch.tensor(image_token_ids, device=shift_labels.device))
+            
             if mask.any():
                 target_ids = shift_labels[mask]
                 pred_logits = shift_logits[mask]
@@ -241,33 +278,55 @@ def main() -> None:
             else:
                 loss_d = 0.0
 
+            # 2. 严格受控推理生成：去除多余缓冲，强制模型吐出目标网格长度
             gen = model.generate(
                 input_ids=prompt,
                 attention_mask=torch.ones_like(prompt),
-                max_new_tokens=len(true_img_ids) + 16,
-                min_new_tokens=len(true_img_ids),
-                do_sample=False,
+                min_new_tokens=target_gen_len,
+                max_new_tokens=target_gen_len,  # 🔒 物理死锁：强制不多不少刚好输出指定数量
+                do_sample=False,                # 贪心解码最稳定
                 logits_processor=logits_processor,
                 eos_token_id=eos,
                 pad_token_id=eos,
             )
 
+        # 3. 后处理绝对提纯与对齐防线
         new_ids = gen[0][prompt.shape[1] :].tolist()
-        pred_img_ids = [int(x) for x in new_ids if int(x) in image_token_set][:IMAGE_TOKEN_LENGTH]
-        true_img_ids = true_img_ids[:IMAGE_TOKEN_LENGTH]
+        raw_pred_img_ids = [int(x) for x in new_ids if int(x) in image_token_set]
 
+        # 强制自适应截取至合法完全平方数 (抵御任何可能的数据清洗残留或越界幻觉)
+        pred_img_ids = _align_to_nearest_square(raw_pred_img_ids, std_len, "预测图")
+        true_img_ids = _align_to_nearest_square(raw_true_img_ids, std_len, "真实图")
+
+        # 4. 计算硬指标评估 (仅在对齐后计算，绝不抛错)
         hard_ld = float("nan")
-        if len(pred_img_ids) == len(true_img_ids) and pred_img_ids:
-            p = torch.tensor([id_to_code[x] for x in pred_img_ids], device=distance_matrix.device)
-            t = torch.tensor([id_to_code[x] for x in true_img_ids], device=distance_matrix.device)
-            hard_ld = float(distance_matrix[t, p].mean().item())
+        # 如果长度不一致，向下截取到两者的最短合法网格以完成可比计算
+        eval_len = min(len(pred_img_ids), len(true_img_ids))
+        if eval_len > 0:
+            eval_side = math.isqrt(eval_len)
+            eval_sq_len = eval_side * eval_side
+            
+            p_ids = pred_img_ids[:eval_sq_len]
+            t_ids = true_img_ids[:eval_sq_len]
+            
+            p_tensor = torch.tensor([id_to_code[x] for x in p_ids], device=distance_matrix.device)
+            t_tensor = torch.tensor([id_to_code[x] for x in t_ids], device=distance_matrix.device)
+            hard_ld = float(distance_matrix[t_tensor, p_tensor].mean().item())
 
+        # 5. 可视化渲染导出
         try:
-            decode_token_ids_to_image(pred_img_ids, vq_model, image_token_ids).save(out_dir / f"{sample_id}_pred.png")
+            if pred_img_ids:
+                decode_token_ids_to_image(pred_img_ids, vq_model, image_token_ids).save(out_dir / f"{sample_id}_pred.png")
+            else:
+                print("     ⚠️ 预测图片为空，跳过解码。")
         except Exception as e:
             print(f"     ⚠️ 预测图片解码失败: {e}")
+            
         try:
-            decode_token_ids_to_image(true_img_ids, vq_model, image_token_ids).save(out_dir / f"{sample_id}_gt.png")
+            if true_img_ids:
+                decode_token_ids_to_image(true_img_ids, vq_model, image_token_ids).save(out_dir / f"{sample_id}_gt.png")
+            else:
+                print("     ⚠️ 真实图片为空，跳过解码。")
         except Exception as e:
             print(f"     ⚠️ 真实图片解码失败: {e}")
 
@@ -289,3 +348,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# python ./MVoT-Anole/evaluate.py

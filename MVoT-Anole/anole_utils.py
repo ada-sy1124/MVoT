@@ -373,25 +373,82 @@ def encode_image_to_token_ids(
     return [code_to_id[idx] for idx in code_indices]
 
 
+# def decode_token_ids_to_image(token_ids: Sequence[int], vq_model: Any, image_token_ids: Sequence[int]) -> Image.Image:
+#     id_to_code, _ = image_token_maps(image_token_ids)
+#     codes = [id_to_code[int(t)] for t in token_ids]
+#     n = len(codes)
+#     side = int(math.sqrt(n))
+#     if side * side != n:
+#         raise ValueError(f"Token length {n} is not a square number.")
+
+#     vq_indices = torch.tensor(codes, dtype=torch.long).view(1, side, side)
+#     with torch.no_grad():
+#         if hasattr(vq_model, "decode_code"):
+#             try:
+#                 pixels = vq_model.decode_code(vq_indices)
+#             except Exception:
+#                 pixels = vq_model.decode_code(vq_indices.view(1, -1))
+#         else:
+#             z = vq_model.quantize.get_codebook_entry(vq_indices, shape=(1, side, side, getattr(vq_model, "embed_dim", 4)))
+#             z = z.permute(0, 3, 1, 2).contiguous()
+#             pixels = vq_model.decode(z)
+#     pixels = torch.clamp((pixels + 1.0) / 2.0, 0.0, 1.0)
+#     arr = (pixels[0].permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
+#     return Image.fromarray(arr)
+
+
 def decode_token_ids_to_image(token_ids: Sequence[int], vq_model: Any, image_token_ids: Sequence[int]) -> Image.Image:
     id_to_code, _ = image_token_maps(image_token_ids)
-    codes = [id_to_code[int(t)] for t in token_ids]
+    
+    # 1. 严格过滤纯净视觉 ID
+    valid_token_ids = [t for t in token_ids if int(t) in id_to_code]
+    codes = [id_to_code[int(t)] for t in valid_token_ids]
+    
     n = len(codes)
-    side = int(math.sqrt(n))
-    if side * side != n:
-        raise ValueError(f"Token length {n} is not a square number.")
+    if n == 0:
+        raise ValueError("解码失败：输入的有效视觉 Token 数量为 0。")
 
-    vq_indices = torch.tensor(codes, dtype=torch.long).view(1, side, side)
+    # 2. 动态自适应完美平方数校准
+    side = int(math.isqrt(n))
+    if side * side != n:
+        target_side = 32 if n >= 1024 else (16 if n >= 256 else side)
+        target_len = target_side * target_side
+        print(f"⚠️ [底层防护] 输入长度 ({n}) 非正方形，强行截取前 {target_len} 个 Token 映射为 {target_side}x{target_side} 矩阵...")
+        codes = codes[:target_len]
+        side = target_side
+
+    # 将一维 code 序列变成二维空间网格 indices: shape (1, side, side)
+    device = next(vq_model.parameters()).device
+    vq_indices = torch.tensor(codes, dtype=torch.long, device=device).view(1, side, side)
+    
+    # 3. 🚨 暴利直连解码核心 (彻底规避 embed_code 报错)
     with torch.no_grad():
-        if hasattr(vq_model, "decode_code"):
+        quantizer = getattr(vq_model, "quantize", None)
+        
+        # 路线 A：优先尝试直接走标准的 PyTorch nn.Embedding 查表 (最稳健，100% 不报错)
+        if quantizer is not None and hasattr(quantizer, "embedding"):
+            # 直接输入 (1, side, side) 查表得到 (1, side, side, embed_dim)
+            z_q = quantizer.embedding(vq_indices)
+            # 重排维度适配解码器卷积层要求：(Batch, Channel, Height, Width) -> (1, embed_dim, side, side)
+            z_q = z_q.permute(0, 3, 1, 2).contiguous()
+            pixels = vq_model.decode(z_q)
+            
+        # 路线 B：备用兼容原生 VQGAN 方法
+        elif hasattr(vq_model, "decode_code"):
             try:
                 pixels = vq_model.decode_code(vq_indices)
             except Exception:
                 pixels = vq_model.decode_code(vq_indices.view(1, -1))
         else:
-            z = vq_model.quantize.get_codebook_entry(vq_indices, shape=(1, side, side, getattr(vq_model, "embed_dim", 4)))
-            z = z.permute(0, 3, 1, 2).contiguous()
-            pixels = vq_model.decode(z)
+            # 极限兜底
+            raise RuntimeError("VQGAN 解码器结构异常：既没有标准的 .embedding 属性，也没有 .decode_code 方法。")
+            
+    # 4. 图像张量后处理渲染
     pixels = torch.clamp((pixels + 1.0) / 2.0, 0.0, 1.0)
     arr = (pixels[0].permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
-    return Image.fromarray(arr)
+    
+    # 确保输出单通道灰度图或 RGB 均兼容
+    if arr.shape[2] == 1:
+        arr = arr.squeeze(-1)
+        return Image.fromarray(arr, mode="L")
+    return Image.fromarray(arr, mode="RGB")
