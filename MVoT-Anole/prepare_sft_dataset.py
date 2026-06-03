@@ -175,11 +175,15 @@ VQGAN_CKPT = "./MVoT-Anole/vqgan_finetuned/maze_vqgan_epoch_25.ckpt"
 
 INPUT_JSONL = "data/训练样本/maze_dataset_merged_600.jsonl"
 IMAGE_ROOT = "data/600个单步样本image"
-OUTPUT_JSONL = "MVoT-Anole/data/sft_训练样本_anole.jsonl"
-META_JSON = "MVoT-Anole/data/sft_训练样本_anole.meta.json"
+
+# OUTPUT_JSONL = "MVoT-Anole/data/sft_训练样本_anole.jsonl"
+# META_JSON = "MVoT-Anole/data/sft_训练样本_anole.meta.json"
+OUTPUT_JSONL = "MVoT-Anole/data/sft_测试样本_anole.jsonl"
+META_JSON = "MVoT-Anole/data/sft_测试样本_anole.meta.json"
 
 START_INDEX = 50
-END_INDEX = 250
+# END_INDEX = 250
+END_INDEX = 51
 
 # 🚨 词表对齐参数
 IMAGE_TOKEN_START = 8192   # 必须与你模型 Embedding 层预留的图像起点一致
@@ -222,6 +226,34 @@ def load_vqgan(config_path: str, ckpt_path: str, device: str):
     model.load_state_dict(state_dict, strict=False)
     return model.to(device).eval(), cfg
 
+# def encode_image_to_token_ids(image_path: str, vq_model: Any, resolution: int, device: str, offset: int) -> List[int]:
+#     # 1. 预处理图像
+#     img = Image.open(image_path).convert("RGB").resize((resolution, resolution), Image.BICUBIC)
+#     x = torch.tensor(list(img.getdata()), dtype=torch.float32).view(resolution, resolution, 3)
+#     x = (x.permute(2, 0, 1).unsqueeze(0) / 255.0 * 2.0 - 1.0).to(device)
+    
+#     # 2. 抽取原始 Token (0 ~ 16383)
+#     with torch.no_grad():
+#         encoded = vq_model.encode(x)
+#         z = encoded[0] if isinstance(encoded, tuple) else encoded
+#         q_out = vq_model.quantize(z)
+        
+#         # 🌟 修复点：精准解析 taming 库的嵌套 tuple
+#         # q_out[2] 是 info tuple: (perplexity, min_encodings, min_encoding_indices)
+#         info = q_out[2]
+#         if isinstance(info, tuple) and len(info) >= 3:
+#             raw_indices_tensor = info[2]
+#         elif torch.is_tensor(info):
+#             raw_indices_tensor = info
+#         else:
+#             raise RuntimeError("无法从 quantize 输出中解析出 Token 索引。")
+            
+#         raw_indices = raw_indices_tensor.view(-1).to(torch.long).cpu().tolist()
+    
+#     # 3. 加上偏移量，映射到 LLM 的大词表
+#     mapped_indices = [idx + offset for idx in raw_indices]
+#     return mapped_indices
+
 def encode_image_to_token_ids(image_path: str, vq_model: Any, resolution: int, device: str, offset: int) -> List[int]:
     # 1. 预处理图像
     img = Image.open(image_path).convert("RGB").resize((resolution, resolution), Image.BICUBIC)
@@ -234,8 +266,6 @@ def encode_image_to_token_ids(image_path: str, vq_model: Any, resolution: int, d
         z = encoded[0] if isinstance(encoded, tuple) else encoded
         q_out = vq_model.quantize(z)
         
-        # 🌟 修复点：精准解析 taming 库的嵌套 tuple
-        # q_out[2] 是 info tuple: (perplexity, min_encodings, min_encoding_indices)
         info = q_out[2]
         if isinstance(info, tuple) and len(info) >= 3:
             raw_indices_tensor = info[2]
@@ -244,11 +274,25 @@ def encode_image_to_token_ids(image_path: str, vq_model: Any, resolution: int, d
         else:
             raise RuntimeError("无法从 quantize 输出中解析出 Token 索引。")
             
-        raw_indices = raw_indices_tensor.view(-1).to(torch.long).cpu().tolist()
+        # 🌟 核心修复点：显式重塑为正确的空间维度 (1, 32, 32)，并强制物理连续化
+        # VQGAN 在 resolution=256 时，标准下采样特征图必须是 32x32
+        expected_side = resolution // 8
+        total_tokens = expected_side * expected_side
+        
+        # 确保无论量化器底层输出的是一维还是三维，都强制统一排布
+        grid_indices = raw_indices_tensor.reshape(1, expected_side, expected_side)
+        
+        # 强制按标准行扫描顺序 (从左到右，从上到下) 连续展平
+        raw_indices = grid_indices.contiguous().view(-1).to(torch.long).cpu().tolist()
+        
+        # 终极物理保险：确保数量绝对准确
+        if len(raw_indices) != total_tokens:
+            raise ValueError(f"严重空间解析错误: 期望 {total_tokens} 个Token，实际提取了 {len(raw_indices)} 个。")
     
     # 3. 加上偏移量，映射到 LLM 的大词表
     mapped_indices = [idx + offset for idx in raw_indices]
     return mapped_indices
+
 
 # ---------------------------------------------------------------------
 

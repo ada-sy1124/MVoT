@@ -34,3 +34,4 @@ test_gt_reconstruction9.png
 __pycache__/测试脚本.cpython-313.pyc
 /训练脚本/
 /训练样本准备/
+check_data.py
